@@ -1,15 +1,84 @@
 import google.generativeai as genai
 from PIL import Image
 import json
+import base64
+import requests
+from io import BytesIO
 from typing import Dict, List
-from config import GEMINI_API_KEY
-
-genai.configure(api_key=GEMINI_API_KEY)
+from config import GEMINI_API_KEY, OPENROUTER_API_KEY, OPENROUTER_MODEL
 
 
 class BillAnalyzer:
     def __init__(self):
-        self.model = genai.GenerativeModel('gemini-2.5-flash-lite-preview-09-2025')
+        # Determine which AI provider to use
+        self.use_openrouter = bool(OPENROUTER_API_KEY)
+
+        if self.use_openrouter:
+            self.openrouter_api_key = OPENROUTER_API_KEY
+            self.openrouter_model = OPENROUTER_MODEL
+            print(f"Using OpenRouter with model: {self.openrouter_model}")
+        else:
+            genai.configure(api_key=GEMINI_API_KEY)
+            self.model = genai.GenerativeModel('gemini-2.5-flash-lite-preview-09-2025')
+            print("Using Gemini API")
+
+    def _analyze_with_openrouter(self, image_path: str, prompt: str) -> str:
+        """Analyze image using OpenRouter API."""
+        # Read and encode image
+        with open(image_path, 'rb') as image_file:
+            image_data = base64.b64encode(image_file.read()).decode('utf-8')
+
+        # Determine image MIME type
+        if image_path.lower().endswith('.png'):
+            mime_type = 'image/png'
+        elif image_path.lower().endswith('.jpg') or image_path.lower().endswith('.jpeg'):
+            mime_type = 'image/jpeg'
+        else:
+            mime_type = 'image/jpeg'  # default
+
+        headers = {
+            'Authorization': f'Bearer {self.openrouter_api_key}',
+            'Content-Type': 'application/json'
+        }
+
+        data = {
+            'model': self.openrouter_model,
+            'messages': [
+                {
+                    'role': 'user',
+                    'content': [
+                        {
+                            'type': 'text',
+                            'text': prompt
+                        },
+                        {
+                            'type': 'image_url',
+                            'image_url': {
+                                'url': f'data:{mime_type};base64,{image_data}'
+                            }
+                        }
+                    ]
+                }
+            ]
+        }
+
+        response = requests.post(
+            'https://openrouter.ai/api/v1/chat/completions',
+            headers=headers,
+            json=data
+        )
+
+        if response.status_code != 200:
+            raise Exception(f"OpenRouter API error: {response.status_code} - {response.text}")
+
+        result = response.json()
+        return result['choices'][0]['message']['content']
+
+    def _analyze_with_gemini(self, image_path: str, prompt: str) -> str:
+        """Analyze image using Gemini API."""
+        image = Image.open(image_path)
+        response = self.model.generate_content([prompt, image])
+        return response.text
 
     def analyze_bill(self, image_path: str) -> Dict:
         """
@@ -27,8 +96,6 @@ class BillAnalyzer:
             }
         """
         try:
-            image = Image.open(image_path)
-
             prompt = """
             Analyze this restaurant bill and extract the following information in JSON format:
 
@@ -60,10 +127,14 @@ class BillAnalyzer:
             - Only return the JSON, no additional text
             """
 
-            response = self.model.generate_content([prompt, image])
+            # Choose provider
+            if self.use_openrouter:
+                response_text = self._analyze_with_openrouter(image_path, prompt)
+            else:
+                response_text = self._analyze_with_gemini(image_path, prompt)
 
             # Extract JSON from response
-            response_text = response.text.strip()
+            response_text = response_text.strip()
 
             # Remove markdown code blocks if present
             if response_text.startswith('```'):

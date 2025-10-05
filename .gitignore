@@ -1,17 +1,67 @@
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
-env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
 venv/
 ENV/
-.env
-.venv
-*.log
+env/
+
+# Temporary files and data
 temp_photos/
-*.db
-.DS_Store
-uv.lock
-user_pairings.json
 temp_photos/saved_headshots/
+user_pairings.json
+*.tmp
+*.log
+*.db
+*.sqlite
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# UV lock file (optional - include if you want reproducible builds)
+# uv.lock
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Docker volumes
+data/
+
+# Keep important files
+!paynow-logo.png
+!requirements.txt

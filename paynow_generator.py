@@ -1,11 +1,13 @@
-import qrcode
+from paynow import PayNowQR
 from io import BytesIO
 from typing import Optional
 from config import PAYNOW_RECIPIENT_PHONE, PAYNOW_RECIPIENT_NAME
+import os
+import tempfile
 
 
 class PayNowGenerator:
-    """Generate PayNow QR codes for Singapore payments."""
+    """Generate PayNow QR codes for Singapore payments using PayNowQR library."""
 
     def __init__(
         self, recipient_phone: Optional[str] = None, recipient_name: Optional[str] = None
@@ -13,82 +15,11 @@ class PayNowGenerator:
         self.recipient_phone = recipient_phone or PAYNOW_RECIPIENT_PHONE
         self.recipient_name = recipient_name or PAYNOW_RECIPIENT_NAME
 
-    def generate_paynow_string(
-        self, amount: float, reference: str = ""
-    ) -> str:
-        """
-        Generate PayNow QR code string following Singapore's PayNow format.
-
-        PayNow QR format (EMV QR Code):
-        - Payload Format Indicator: "00" + "02" + "01"
-        - Point of Initiation: "01" + "02" + "12" (static QR)
-        - Merchant Account: "26" + length + PayNow data
-        - Transaction Currency: "53" + "03" + "702" (SGD)
-        - Transaction Amount: "54" + length + amount
-        - Country Code: "58" + "02" + "SG"
-        - Merchant Name: "59" + length + name
-        - Additional Data: "62" + length + reference data
-        - CRC: "63" + "04" + checksum
-        """
-
-        def format_field(tag: str, value: str) -> str:
-            """Format a field with tag-length-value."""
-            length = str(len(value)).zfill(2)
-            return f"{tag}{length}{value}"
-
-        # Build PayNow merchant data (tag 26)
-        paynow_data = ""
-        paynow_data += format_field("00", "SG.PAYNOW")  # PayNow identifier
-        paynow_data += format_field("01", "2")  # Proxy type: 2 = mobile number
-        paynow_data += format_field(
-            "02", self.recipient_phone.replace("+", "").replace(" ", "")
-        )  # Mobile number
-        paynow_data += format_field("03", "1")  # Editable: 1 = amount is editable
-
-        # Build main payload
-        payload = ""
-        payload += format_field("00", "01")  # Payload format indicator
-        payload += format_field("01", "12")  # Point of initiation (static)
-        payload += format_field("26", paynow_data)  # Merchant account info
-        payload += format_field("52", "0000")  # Merchant category code
-        payload += format_field("53", "702")  # Currency: 702 = SGD
-        payload += format_field("54", f"{amount:.2f}")  # Transaction amount
-        payload += format_field("58", "SG")  # Country code
-        payload += format_field("59", self.recipient_name[:25])  # Merchant name (max 25 chars)
-
-        # Additional data (reference)
-        if reference:
-            additional_data = format_field("01", reference[:25])  # Reference (max 25 chars)
-            payload += format_field("62", additional_data)
-
-        # Calculate CRC16-CCITT checksum
-        payload += "6304"  # CRC tag and length
-        crc = self._calculate_crc16(payload)
-        payload += crc
-
-        return payload
-
-    def _calculate_crc16(self, data: str) -> str:
-        """Calculate CRC16-CCITT checksum for PayNow QR."""
-        crc = 0xFFFF
-        polynomial = 0x1021
-
-        for byte in data.encode('utf-8'):
-            crc ^= byte << 8
-            for _ in range(8):
-                if crc & 0x8000:
-                    crc = (crc << 1) ^ polynomial
-                else:
-                    crc <<= 1
-                crc &= 0xFFFF
-
-        return f"{crc:04X}"
-
     def generate_qr_code(
         self, amount: float, reference: str = "", person_name: str = ""
     ) -> BytesIO:
         """
-        Generate a PayNow QR code image.
+        Generate a PayNow QR code image using the PayNowQR library.
 
         Args:
             amount: Amount to request
@@ -98,6 +29,7 @@ class PayNowGenerator:
         Returns:
             BytesIO object containing the QR code image
         """
+        # Build reference string
         if person_name and reference:
             full_reference = f"{reference} - {person_name}"
         elif person_name:
@@ -105,26 +37,37 @@ class PayNowGenerator:
         else:
             full_reference = reference
 
-        paynow_string = self.generate_paynow_string(amount, full_reference)
+        # Limit reference to 25 characters
+        full_reference = full_reference[:25] if full_reference else "Bill Split"
 
-        # Generate QR code
-        qr = qrcode.QRCode(
-            version=1,
-            error_correction=qrcode.constants.ERROR_CORRECT_M,
-            box_size=10,
-            border=4,
+        # Create PayNowQR object
+        # PayNowQR(recipient_type, recipient_id, recipient_name, amount, reference, expiry_date, brand_colour)
+        qr = PayNowQR(
+            "MOBILE",  # Type must be uppercase
+            self.recipient_phone,
+            self.recipient_name,
+            amount,
+            full_reference
         )
-        qr.add_data(paynow_string)
-        qr.make(fit=True)
 
-        img = qr.make_image(fill_color="black", back_color="white")
+        # Save to temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as tmp_file:
+            tmp_path = tmp_file.name
 
-        # Save to BytesIO
-        bio = BytesIO()
-        img.save(bio, 'PNG')
-        bio.seek(0)
+        try:
+            # Generate and save QR code
+            qr.save(tmp_path)
 
-        return bio
+            # Read the file into BytesIO
+            with open(tmp_path, 'rb') as f:
+                bio = BytesIO(f.read())
+            bio.seek(0)
+
+            return bio
+        finally:
+            # Clean up temporary file
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
 
     def format_payment_message(
         self, amount: float, items: list, restaurant: str = ""

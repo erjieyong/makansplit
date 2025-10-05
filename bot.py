@@ -13,6 +13,9 @@ from telegram.ext import (
 from config import (
     TELEGRAM_BOT_TOKEN,
     WAITING_BILL_PHOTO,
+    CHOOSING_SPLIT_MODE,
+    TAGGING_USERS,
+    MANUAL_ASSIGNMENT,
     WAITING_GROUP_PHOTO,
     ANALYZING,
     MATCHING_USERS,
@@ -93,16 +96,24 @@ class BillSplitterBot:
             summary = self.bill_analyzer.format_bill_summary(bill_data)
             await update.message.reply_text(summary, parse_mode='Markdown')
 
+            # Show splitting mode options
+            keyboard = [
+                [InlineKeyboardButton("➗ Split Evenly", callback_data="mode_even")],
+                [InlineKeyboardButton("✏️ Split Manually", callback_data="mode_manual")],
+                [InlineKeyboardButton("📸 Split by Photo (AI)", callback_data="mode_photo")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
             await update.message.reply_text(
-                "\nGreat! Now please send me a *photo of everyone at the table with their food* 📸\n\n"
-                "Make sure:\n"
-                "✓ Everyone's face is visible\n"
-                "✓ Food items are clearly visible\n"
-                "✓ Good lighting",
+                "\n💡 *How would you like to split the bill?*\n\n"
+                "• *Split Evenly* - Divide equally among everyone\n"
+                "• *Split Manually* - Manually assign who ate what\n"
+                "• *Split by Photo (AI)* - Auto-detect from group photo",
+                reply_markup=reply_markup,
                 parse_mode='Markdown'
             )
 
-            return WAITING_GROUP_PHOTO
+            return CHOOSING_SPLIT_MODE
 
         except Exception as e:
             logger.error(f"Error analyzing bill: {e}")
@@ -115,6 +126,608 @@ class BillSplitterBot:
                 "✓ No glare or shadows"
             )
             return WAITING_BILL_PHOTO
+
+    async def handle_split_mode_choice(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> int:
+        """Handle the user's choice of splitting mode."""
+        query = update.callback_query
+        await query.answer()
+
+        if query.data == "mode_even":
+            # Even split mode
+            await query.edit_message_text(
+                "➗ *Even Split Mode*\n\n"
+                "The bill will be split equally among all participants.\n"
+                "Please tag everyone who's eating using the buttons below.",
+                parse_mode='Markdown'
+            )
+            context.user_data['split_mode'] = 'even'
+            return await self.start_user_tagging(update, context)
+
+        elif query.data == "mode_manual":
+            # Manual split mode
+            await query.edit_message_text(
+                "✏️ *Manual Split Mode*\n\n"
+                "You'll assign who ate what item by item.\n"
+                "Let's start!",
+                parse_mode='Markdown'
+            )
+            context.user_data['split_mode'] = 'manual'
+            context.user_data['manual_assignments'] = {}  # {item_index: [person_ids]}
+            context.user_data['current_item_index'] = 0
+            return await self.start_manual_assignment(update, context)
+
+        elif query.data == "mode_photo":
+            # Photo AI mode (existing flow)
+            await query.edit_message_text(
+                "📸 *Photo AI Mode*\n\n"
+                "Great! Now please send me a *photo of everyone at the table with their food* 📸\n\n"
+                "Make sure:\n"
+                "✓ Everyone's face is visible\n"
+                "✓ Food items are clearly visible\n"
+                "✓ Good lighting",
+                parse_mode='Markdown'
+            )
+            context.user_data['split_mode'] = 'photo'
+            return WAITING_GROUP_PHOTO
+
+    async def start_user_tagging(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> int:
+        """Start the user tagging process for even split."""
+        # Initialize tagged users list if not exists
+        if 'tagged_users' not in context.user_data:
+            context.user_data['tagged_users'] = []
+
+        # Get chat members for tagging
+        chat_members = []
+
+        # First, try to get from stored members (users who have interacted)
+        if 'known_members' not in context.bot_data:
+            context.bot_data['known_members'] = {}
+
+        chat_id = update.effective_chat.id
+        if chat_id not in context.bot_data['known_members']:
+            context.bot_data['known_members'][chat_id] = {}
+
+        # Add current user to known members
+        current_user = update.effective_user
+        context.bot_data['known_members'][chat_id][current_user.id] = {
+            'id': current_user.id,
+            'first_name': current_user.first_name,
+            'last_name': current_user.last_name,
+            'username': current_user.username,
+            'mention': current_user.mention_html()
+        }
+
+        try:
+            # Get chat administrators
+            chat_admins = await context.bot.get_chat_administrators(chat_id)
+            for admin in chat_admins:
+                user = admin.user
+                if not user.is_bot:
+                    context.bot_data['known_members'][chat_id][user.id] = {
+                        'id': user.id,
+                        'first_name': user.first_name,
+                        'last_name': user.last_name,
+                        'username': user.username,
+                        'mention': user.mention_html()
+                    }
+        except Exception as e:
+            logger.warning(f"Could not get chat administrators: {e}")
+
+        # Convert known members to list
+        chat_members = list(context.bot_data['known_members'][chat_id].values())
+        context.user_data['chat_members'] = chat_members
+
+        # Build keyboard with chat members
+        keyboard = []
+        tagged_user_ids = context.user_data['tagged_users']
+
+        for member in chat_members:
+            display_name = member['first_name']
+            if member['username']:
+                display_name += f" (@{member['username']})"
+
+            # Add checkmark if already tagged
+            if member['id'] in tagged_user_ids:
+                display_name = "✅ " + display_name
+                callback_data = f"untag_{member['id']}"
+            else:
+                callback_data = f"tag_{member['id']}"
+
+            keyboard.append([
+                InlineKeyboardButton(display_name, callback_data=callback_data)
+            ])
+
+        # Add done button
+        keyboard.append([
+            InlineKeyboardButton("✅ Done", callback_data="tagging_done")
+        ])
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        message_text = f"👥 *Select everyone who's eating*\n\n"
+        message_text += f"Currently selected: {len(tagged_user_ids)} people\n\n"
+        message_text += "Tap a name to add/remove them from the split.\n\n"
+        message_text += "💡 _Tip: If someone isn't in the list, ask them to send any message in this chat first!_"
+
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=message_text,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+        return TAGGING_USERS
+
+    async def handle_user_tagging(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> int:
+        """Handle user tagging for even split."""
+        query = update.callback_query
+        await query.answer()
+
+        if query.data.startswith('tag_'):
+            # Add user to tagged list
+            user_id = int(query.data.split('_')[1])
+            if user_id not in context.user_data['tagged_users']:
+                context.user_data['tagged_users'].append(user_id)
+            # Refresh the keyboard
+            return await self.refresh_user_tagging(update, context)
+
+        elif query.data.startswith('untag_'):
+            # Remove user from tagged list
+            user_id = int(query.data.split('_')[1])
+            if user_id in context.user_data['tagged_users']:
+                context.user_data['tagged_users'].remove(user_id)
+            # Refresh the keyboard
+            return await self.refresh_user_tagging(update, context)
+
+        elif query.data == 'tagging_done':
+            # Finish tagging and calculate even split
+            tagged_users = context.user_data['tagged_users']
+
+            if len(tagged_users) == 0:
+                await query.answer("Please select at least one person!", show_alert=True)
+                return TAGGING_USERS
+
+            await query.edit_message_text(
+                f"✅ Selected {len(tagged_users)} people for even split!"
+            )
+
+            # Calculate even split
+            bill_data = context.user_data['bill_data']
+            total = bill_data['total']
+            per_person = round(total / len(tagged_users), 2)
+
+            # Create totals dict
+            totals = {user_id: per_person for user_id in tagged_users}
+            context.user_data['totals'] = totals
+            context.user_data['matches'] = {i+1: user_id for i, user_id in enumerate(tagged_users)}
+
+            # Store user info for later
+            chat_members = context.user_data.get('chat_members', [])
+            user_info = {member['id']: member for member in chat_members}
+            context.user_data['user_info'] = user_info
+
+            # Show summary
+            summary = f"📊 *Even Split Summary*\n\n"
+            summary += f"Total: ${total:.2f}\n"
+            summary += f"Split {len(tagged_users)} ways: ${per_person:.2f} per person\n\n"
+            summary += "*People:*\n"
+            for user_id in tagged_users:
+                if user_id in user_info:
+                    summary += f"• {user_info[user_id]['first_name']} - ${per_person:.2f}\n"
+
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=summary,
+                parse_mode='Markdown'
+            )
+
+            # Ask for confirmation
+            keyboard = [
+                [
+                    InlineKeyboardButton("✅ Looks good!", callback_data="confirm_yes"),
+                    InlineKeyboardButton("❌ Cancel", callback_data="confirm_cancel"),
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="\n*Does this look correct?*",
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+
+            return CONFIRMING
+
+    async def refresh_user_tagging(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> int:
+        """Refresh the user tagging keyboard."""
+        query = update.callback_query
+
+        # Get chat members
+        chat_members = context.user_data.get('chat_members', [])
+        tagged_user_ids = context.user_data['tagged_users']
+
+        # Build keyboard
+        keyboard = []
+        for member in chat_members:
+            display_name = member['first_name']
+            if member['username']:
+                display_name += f" (@{member['username']})"
+
+            # Add checkmark if already tagged
+            if member['id'] in tagged_user_ids:
+                display_name = "✅ " + display_name
+                callback_data = f"untag_{member['id']}"
+            else:
+                callback_data = f"tag_{member['id']}"
+
+            keyboard.append([
+                InlineKeyboardButton(display_name, callback_data=callback_data)
+            ])
+
+        # Add done button
+        keyboard.append([
+            InlineKeyboardButton("✅ Done", callback_data="tagging_done")
+        ])
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        message_text = f"👥 *Select everyone who's eating*\n\n"
+        message_text += f"Currently selected: {len(tagged_user_ids)} people\n\n"
+        message_text += "Tap a name to add/remove them from the split.\n\n"
+        message_text += "💡 _Tip: If someone isn't in the list, ask them to send any message in this chat first!_"
+
+        await query.edit_message_text(
+            text=message_text,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+        return TAGGING_USERS
+
+    async def start_manual_assignment(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> int:
+        """Start the manual item assignment process."""
+        bill_data = context.user_data['bill_data']
+        items = bill_data['items']
+        current_index = context.user_data['current_item_index']
+
+        if current_index >= len(items):
+            # All items assigned, show summary
+            return await self.show_manual_split_summary(update, context)
+
+        item = items[current_index]
+
+        # Get chat members
+        if 'chat_members' not in context.user_data:
+            chat_members = []
+
+            # First, try to get from stored members (users who have interacted)
+            if 'known_members' not in context.bot_data:
+                context.bot_data['known_members'] = {}
+
+            chat_id = update.effective_chat.id
+            if chat_id not in context.bot_data['known_members']:
+                context.bot_data['known_members'][chat_id] = {}
+
+            # Add current user to known members
+            current_user = update.effective_user
+            context.bot_data['known_members'][chat_id][current_user.id] = {
+                'id': current_user.id,
+                'first_name': current_user.first_name,
+                'last_name': current_user.last_name,
+                'username': current_user.username,
+                'mention': current_user.mention_html()
+            }
+
+            try:
+                # Get chat administrators
+                chat_admins = await context.bot.get_chat_administrators(chat_id)
+                for admin in chat_admins:
+                    user = admin.user
+                    if not user.is_bot:
+                        context.bot_data['known_members'][chat_id][user.id] = {
+                            'id': user.id,
+                            'first_name': user.first_name,
+                            'last_name': user.last_name,
+                            'username': user.username,
+                            'mention': user.mention_html()
+                        }
+            except Exception as e:
+                logger.warning(f"Could not get chat administrators: {e}")
+
+            # Convert known members to list
+            chat_members = list(context.bot_data['known_members'][chat_id].values())
+            context.user_data['chat_members'] = chat_members
+
+        # Initialize assignment for this item if not exists
+        if current_index not in context.user_data['manual_assignments']:
+            context.user_data['manual_assignments'][current_index] = []
+
+        # Build keyboard
+        keyboard = []
+        assigned_users = context.user_data['manual_assignments'][current_index]
+        chat_members = context.user_data['chat_members']
+
+        for member in chat_members:
+            display_name = member['first_name']
+            if member['username']:
+                display_name += f" (@{member['username']})"
+
+            # Add checkmark if already assigned
+            if member['id'] in assigned_users:
+                display_name = "✅ " + display_name
+                callback_data = f"unassign_{current_index}_{member['id']}"
+            else:
+                callback_data = f"assign_{current_index}_{member['id']}"
+
+            keyboard.append([
+                InlineKeyboardButton(display_name, callback_data=callback_data)
+            ])
+
+        # Add select all / deselect all button
+        if len(assigned_users) == len(chat_members):
+            keyboard.append([
+                InlineKeyboardButton("❌ Deselect All", callback_data=f"deselect_all_{current_index}")
+            ])
+        else:
+            keyboard.append([
+                InlineKeyboardButton("✅ Select All", callback_data=f"select_all_{current_index}")
+            ])
+
+        # Add skip and next buttons
+        keyboard.append([
+            InlineKeyboardButton("⏭ Skip item", callback_data=f"skip_item_{current_index}")
+        ])
+        if len(assigned_users) > 0:
+            keyboard.append([
+                InlineKeyboardButton("➡️ Next item", callback_data=f"next_item_{current_index}")
+            ])
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        message_text = f"📝 *Item {current_index + 1}/{len(items)}*\n\n"
+        message_text += f"*{item['name']}* - ${item['price']:.2f}\n\n"
+        message_text += f"Currently assigned to: {len(assigned_users)} people\n\n"
+        message_text += "Select who ate this item (can select multiple):"
+
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=message_text,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+        return MANUAL_ASSIGNMENT
+
+    async def handle_manual_assignment(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> int:
+        """Handle manual item assignment."""
+        query = update.callback_query
+        await query.answer()
+
+        if query.data.startswith('assign_'):
+            # Add user to item assignment
+            parts = query.data.split('_')
+            item_index = int(parts[1])
+            user_id = int(parts[2])
+
+            if user_id not in context.user_data['manual_assignments'][item_index]:
+                context.user_data['manual_assignments'][item_index].append(user_id)
+
+            # Refresh the keyboard
+            return await self.refresh_manual_assignment(update, context)
+
+        elif query.data.startswith('unassign_'):
+            # Remove user from item assignment
+            parts = query.data.split('_')
+            item_index = int(parts[1])
+            user_id = int(parts[2])
+
+            if user_id in context.user_data['manual_assignments'][item_index]:
+                context.user_data['manual_assignments'][item_index].remove(user_id)
+
+            # Refresh the keyboard
+            return await self.refresh_manual_assignment(update, context)
+
+        elif query.data.startswith('select_all_'):
+            # Select all users for this item
+            item_index = int(query.data.split('_')[2])
+            chat_members = context.user_data['chat_members']
+            context.user_data['manual_assignments'][item_index] = [member['id'] for member in chat_members]
+
+            # Refresh the keyboard
+            return await self.refresh_manual_assignment(update, context)
+
+        elif query.data.startswith('deselect_all_'):
+            # Deselect all users for this item
+            item_index = int(query.data.split('_')[2])
+            context.user_data['manual_assignments'][item_index] = []
+
+            # Refresh the keyboard
+            return await self.refresh_manual_assignment(update, context)
+
+        elif query.data.startswith('skip_item_'):
+            # Skip this item
+            await query.edit_message_text(
+                f"⏭ Skipped item {context.user_data['current_item_index'] + 1}"
+            )
+            context.user_data['current_item_index'] += 1
+            return await self.start_manual_assignment(update, context)
+
+        elif query.data.startswith('next_item_'):
+            # Move to next item
+            item_index = context.user_data['current_item_index']
+            assigned_count = len(context.user_data['manual_assignments'][item_index])
+
+            await query.edit_message_text(
+                f"✅ Item {item_index + 1} assigned to {assigned_count} people"
+            )
+
+            context.user_data['current_item_index'] += 1
+            return await self.start_manual_assignment(update, context)
+
+    async def refresh_manual_assignment(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> int:
+        """Refresh the manual assignment keyboard."""
+        query = update.callback_query
+
+        bill_data = context.user_data['bill_data']
+        items = bill_data['items']
+        current_index = context.user_data['current_item_index']
+        item = items[current_index]
+
+        # Build keyboard
+        keyboard = []
+        assigned_users = context.user_data['manual_assignments'][current_index]
+        chat_members = context.user_data['chat_members']
+
+        for member in chat_members:
+            display_name = member['first_name']
+            if member['username']:
+                display_name += f" (@{member['username']})"
+
+            # Add checkmark if already assigned
+            if member['id'] in assigned_users:
+                display_name = "✅ " + display_name
+                callback_data = f"unassign_{current_index}_{member['id']}"
+            else:
+                callback_data = f"assign_{current_index}_{member['id']}"
+
+            keyboard.append([
+                InlineKeyboardButton(display_name, callback_data=callback_data)
+            ])
+
+        # Add select all / deselect all button
+        if len(assigned_users) == len(chat_members):
+            keyboard.append([
+                InlineKeyboardButton("❌ Deselect All", callback_data=f"deselect_all_{current_index}")
+            ])
+        else:
+            keyboard.append([
+                InlineKeyboardButton("✅ Select All", callback_data=f"select_all_{current_index}")
+            ])
+
+        # Add skip and next buttons
+        keyboard.append([
+            InlineKeyboardButton("⏭ Skip item", callback_data=f"skip_item_{current_index}")
+        ])
+        if len(assigned_users) > 0:
+            keyboard.append([
+                InlineKeyboardButton("➡️ Next item", callback_data=f"next_item_{current_index}")
+            ])
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        message_text = f"📝 *Item {current_index + 1}/{len(items)}*\n\n"
+        message_text += f"*{item['name']}* - ${item['price']:.2f}\n\n"
+        message_text += f"Currently assigned to: {len(assigned_users)} people\n\n"
+        message_text += "Select who ate this item (can select multiple):"
+
+        await query.edit_message_text(
+            text=message_text,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+        return MANUAL_ASSIGNMENT
+
+    async def show_manual_split_summary(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> int:
+        """Show summary of manual split assignments."""
+        bill_data = context.user_data['bill_data']
+        items = bill_data['items']
+        assignments = context.user_data['manual_assignments']
+        chat_members = context.user_data.get('chat_members', [])
+        user_info = {member['id']: member for member in chat_members}
+
+        # Calculate totals per user
+        totals = {}
+        for item_index, user_ids in assignments.items():
+            if len(user_ids) > 0:
+                item = items[item_index]
+                # Split item equally among assigned users
+                share_per_person = item['total_price'] / len(user_ids)
+
+                for user_id in user_ids:
+                    if user_id not in totals:
+                        totals[user_id] = 0
+                    totals[user_id] += share_per_person
+
+        # Round totals
+        for user_id in totals:
+            totals[user_id] = round(totals[user_id], 2)
+
+        context.user_data['totals'] = totals
+        context.user_data['user_info'] = user_info
+        context.user_data['matches'] = {i+1: user_id for i, user_id in enumerate(totals.keys())}
+
+        # Build summary message
+        summary = "📊 *Manual Split Summary*\n\n"
+
+        for user_id, total in totals.items():
+            if user_id in user_info:
+                user_name = user_info[user_id]['first_name']
+                summary += f"*{user_name}* - ${total:.2f}\n"
+
+                # Show items for this user
+                user_items = []
+                for item_index, assigned_users in assignments.items():
+                    if user_id in assigned_users:
+                        item = items[item_index]
+                        share = f"({len(assigned_users)} way split)" if len(assigned_users) > 1 else ""
+                        user_items.append(f"  • {item['name']} {share}")
+
+                if user_items:
+                    summary += '\n'.join(user_items)
+                    summary += "\n\n"
+
+        # Show unassigned items
+        unassigned = []
+        for i, item in enumerate(items):
+            if i not in assignments or len(assignments[i]) == 0:
+                unassigned.append(f"• {item['name']} - ${item['price']:.2f}")
+
+        if unassigned:
+            summary += "\n⚠️ *Unassigned items:*\n"
+            summary += '\n'.join(unassigned)
+            summary += "\n\n"
+
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=summary,
+            parse_mode='Markdown'
+        )
+
+        # Ask for confirmation
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ Looks good!", callback_data="confirm_yes"),
+                InlineKeyboardButton("❌ Cancel", callback_data="confirm_cancel"),
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="\n*Does this look correct?*",
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+        return CONFIRMING
 
     async def receive_group_photo(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -588,65 +1201,179 @@ class BillSplitterBot:
         """Send PayNow QR codes to each person."""
         try:
             bill_data = context.user_data['bill_data']
-            people_data = context.user_data['people_data']
             totals = context.user_data['totals']
-            matches = context.user_data.get('matches', {})
             user_info = context.user_data.get('user_info', {})
+            split_mode = context.user_data.get('split_mode', 'photo')
 
             restaurant = bill_data.get('restaurant', 'Restaurant')
 
-            # For each person, prepare their items
-            for person in people_data['people']:
-                person_id = person['person_id']
-                amount = totals[person_id]
+            # Handle different split modes
+            if split_mode == 'even':
+                # Even split: send to each tagged user
+                for user_id, amount in totals.items():
+                    user_name = user_info.get(user_id, {}).get('first_name', 'there')
 
-                # Get their items
-                person_items = []
-                for item_index in person['items']:
-                    item = bill_data['items'][item_index - 1].copy()
-                    share_ratio = person.get('share_ratio', {}).get(str(item_index), 1.0)
-                    item['share_ratio'] = share_ratio
-                    person_items.append(item)
+                    message = f"💰 *Bill Split Request*\n\n"
+                    message += f"Restaurant: {restaurant}\n"
+                    message += f"Your share (even split): *${amount:.2f}*\n\n"
+                    message += "Please scan the QR code below to pay via PayNow."
 
-                # Generate message
-                message = self.paynow_generator.format_payment_message(
-                    amount, person_items, restaurant
-                )
+                    # Generate QR code
+                    reference = f"{restaurant[:15]} split"
+                    qr_code = self.paynow_generator.generate_qr_code(
+                        amount, reference, user_name
+                    )
 
-                # Generate QR code
-                reference = f"{restaurant[:15]} split"
-                qr_code = self.paynow_generator.generate_qr_code(
-                    amount, reference, f"Person {person_id}"
-                )
-
-                # Check if this person was matched to a Telegram user
-                telegram_user_id = matches.get(person_id)
-
-                if telegram_user_id:
-                    # Send direct message to the matched user
+                    # Send direct message
                     try:
-                        user_name = user_info.get(telegram_user_id, {}).get('first_name', 'there')
                         await context.bot.send_message(
-                            chat_id=telegram_user_id,
+                            chat_id=user_id,
                             text=f"Hi {user_name}! 👋\n\n" + message,
                             parse_mode='Markdown'
                         )
 
                         await context.bot.send_photo(
-                            chat_id=telegram_user_id,
+                            chat_id=user_id,
                             photo=qr_code,
                             caption=f"PayNow QR Code - ${amount:.2f}"
                         )
 
-                        # Notify group that DM was sent
+                        # Notify group
                         await context.bot.send_message(
                             chat_id=context.user_data['chat_id'],
-                            text=f"✅ Payment request sent to {user_name} (Person {person_id}) via DM"
+                            text=f"✅ Payment request sent to {user_name} via DM"
                         )
-                        logger.info(f"Sent payment request to user {telegram_user_id} (Person {person_id})")
+                        logger.info(f"Sent payment request to user {user_id}")
                     except Exception as e:
-                        logger.error(f"Failed to send DM to user {telegram_user_id}: {e}")
-                        # Fallback to group message
+                        logger.error(f"Failed to send DM to user {user_id}: {e}")
+                        await context.bot.send_message(
+                            chat_id=context.user_data['chat_id'],
+                            text=f"⚠️ Could not send DM to {user_name}. Please share the QR manually."
+                        )
+
+            elif split_mode == 'manual':
+                # Manual split: send to each user with their items
+                assignments = context.user_data['manual_assignments']
+                items = bill_data['items']
+
+                for user_id, amount in totals.items():
+                    user_name = user_info.get(user_id, {}).get('first_name', 'there')
+
+                    # Get items for this user
+                    user_items = []
+                    for item_index, assigned_users in assignments.items():
+                        if user_id in assigned_users:
+                            item = items[item_index].copy()
+                            item['share_ratio'] = 1.0 / len(assigned_users)
+                            user_items.append(item)
+
+                    # Generate message
+                    message = self.paynow_generator.format_payment_message(
+                        amount, user_items, restaurant
+                    )
+
+                    # Generate QR code
+                    reference = f"{restaurant[:15]} split"
+                    qr_code = self.paynow_generator.generate_qr_code(
+                        amount, reference, user_name
+                    )
+
+                    # Send direct message
+                    try:
+                        await context.bot.send_message(
+                            chat_id=user_id,
+                            text=f"Hi {user_name}! 👋\n\n" + message,
+                            parse_mode='Markdown'
+                        )
+
+                        await context.bot.send_photo(
+                            chat_id=user_id,
+                            photo=qr_code,
+                            caption=f"PayNow QR Code - ${amount:.2f}"
+                        )
+
+                        # Notify group
+                        await context.bot.send_message(
+                            chat_id=context.user_data['chat_id'],
+                            text=f"✅ Payment request sent to {user_name} via DM"
+                        )
+                        logger.info(f"Sent payment request to user {user_id}")
+                    except Exception as e:
+                        logger.error(f"Failed to send DM to user {user_id}: {e}")
+                        await context.bot.send_message(
+                            chat_id=context.user_data['chat_id'],
+                            text=f"⚠️ Could not send DM to {user_name}. Please share the QR manually."
+                        )
+
+            else:  # split_mode == 'photo'
+                # Photo AI mode: existing logic
+                people_data = context.user_data['people_data']
+                matches = context.user_data.get('matches', {})
+
+                for person in people_data['people']:
+                    person_id = person['person_id']
+                    amount = totals[person_id]
+
+                    # Get their items
+                    person_items = []
+                    for item_index in person['items']:
+                        item = bill_data['items'][item_index - 1].copy()
+                        share_ratio = person.get('share_ratio', {}).get(str(item_index), 1.0)
+                        item['share_ratio'] = share_ratio
+                        person_items.append(item)
+
+                    # Generate message
+                    message = self.paynow_generator.format_payment_message(
+                        amount, person_items, restaurant
+                    )
+
+                    # Generate QR code
+                    reference = f"{restaurant[:15]} split"
+                    qr_code = self.paynow_generator.generate_qr_code(
+                        amount, reference, f"Person {person_id}"
+                    )
+
+                    # Check if this person was matched to a Telegram user
+                    telegram_user_id = matches.get(person_id)
+
+                    if telegram_user_id:
+                        # Send direct message to the matched user
+                        try:
+                            user_name = user_info.get(telegram_user_id, {}).get('first_name', 'there')
+                            await context.bot.send_message(
+                                chat_id=telegram_user_id,
+                                text=f"Hi {user_name}! 👋\n\n" + message,
+                                parse_mode='Markdown'
+                            )
+
+                            await context.bot.send_photo(
+                                chat_id=telegram_user_id,
+                                photo=qr_code,
+                                caption=f"PayNow QR Code - ${amount:.2f}"
+                            )
+
+                            # Notify group that DM was sent
+                            await context.bot.send_message(
+                                chat_id=context.user_data['chat_id'],
+                                text=f"✅ Payment request sent to {user_name} (Person {person_id}) via DM"
+                            )
+                            logger.info(f"Sent payment request to user {telegram_user_id} (Person {person_id})")
+                        except Exception as e:
+                            logger.error(f"Failed to send DM to user {telegram_user_id}: {e}")
+                            # Fallback to group message
+                            await context.bot.send_message(
+                                chat_id=context.user_data['chat_id'],
+                                text=f"*Person {person_id}* ({person['position']})\n" + message,
+                                parse_mode='Markdown'
+                            )
+
+                            await context.bot.send_photo(
+                                chat_id=context.user_data['chat_id'],
+                                photo=qr_code,
+                                caption=f"PayNow QR Code for Person {person_id} - ${amount:.2f}"
+                            )
+                    else:
+                        # No match, send to group
                         await context.bot.send_message(
                             chat_id=context.user_data['chat_id'],
                             text=f"*Person {person_id}* ({person['position']})\n" + message,
@@ -658,19 +1385,6 @@ class BillSplitterBot:
                             photo=qr_code,
                             caption=f"PayNow QR Code for Person {person_id} - ${amount:.2f}"
                         )
-                else:
-                    # No match, send to group
-                    await context.bot.send_message(
-                        chat_id=context.user_data['chat_id'],
-                        text=f"*Person {person_id}* ({person['position']})\n" + message,
-                        parse_mode='Markdown'
-                    )
-
-                    await context.bot.send_photo(
-                        chat_id=context.user_data['chat_id'],
-                        photo=qr_code,
-                        caption=f"PayNow QR Code for Person {person_id} - ${amount:.2f}"
-                    )
 
             await context.bot.send_message(
                 chat_id=context.user_data['chat_id'],
@@ -702,23 +1416,47 @@ class BillSplitterBot:
         """Send help message."""
         await update.message.reply_text(
             "*Bill Splitter Bot* 💰\n\n"
-            "I help you split restaurant bills fairly based on who ate what!\n\n"
+            "I help you split restaurant bills with three different modes!\n\n"
             "*Commands:*\n"
             "/start - Start splitting a bill\n"
             "/cancel - Cancel current operation\n"
             "/help - Show this help message\n\n"
             "*How it works:*\n"
             "1. Send me a photo of your bill\n"
-            "2. Send me a photo of everyone with their food\n"
-            "3. I'll analyze and match people to items\n"
-            "4. Confirm and receive PayNow QR codes\n\n"
+            "2. Choose a splitting mode:\n"
+            "   • *Even Split* - Divide equally among everyone\n"
+            "   • *Manual Split* - Assign who ate what item by item\n"
+            "   • *Photo AI Split* - Auto-detect from group photo\n"
+            "3. Confirm and receive PayNow QR codes\n\n"
             "*Tips for best results:*\n"
             "• Use clear, well-lit photos\n"
             "• Make sure all text on bill is readable\n"
-            "• Ensure everyone's face is visible in group photo\n"
-            "• Show food items clearly",
+            "• For Photo AI mode: ensure faces and food are visible",
             parse_mode='Markdown'
         )
+
+    async def track_user(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Track users who send messages in the group."""
+        if update.effective_chat.type in ['group', 'supergroup']:
+            user = update.effective_user
+
+            # Initialize known_members if not exists
+            if 'known_members' not in context.bot_data:
+                context.bot_data['known_members'] = {}
+
+            chat_id = update.effective_chat.id
+            if chat_id not in context.bot_data['known_members']:
+                context.bot_data['known_members'][chat_id] = {}
+
+            # Add user to known members
+            if not user.is_bot:
+                context.bot_data['known_members'][chat_id][user.id] = {
+                    'id': user.id,
+                    'first_name': user.first_name,
+                    'last_name': user.last_name,
+                    'username': user.username,
+                    'mention': user.mention_html()
+                }
 
 
 def main():
@@ -736,6 +1474,18 @@ def main():
             WAITING_BILL_PHOTO: [
                 CommandHandler('start', bot.start),
                 MessageHandler(filters.PHOTO, bot.receive_bill_photo)
+            ],
+            CHOOSING_SPLIT_MODE: [
+                CommandHandler('start', bot.start),
+                CallbackQueryHandler(bot.handle_split_mode_choice)
+            ],
+            TAGGING_USERS: [
+                CommandHandler('start', bot.start),
+                CallbackQueryHandler(bot.handle_user_tagging)
+            ],
+            MANUAL_ASSIGNMENT: [
+                CommandHandler('start', bot.start),
+                CallbackQueryHandler(bot.handle_manual_assignment)
             ],
             WAITING_GROUP_PHOTO: [
                 CommandHandler('start', bot.start),
@@ -765,6 +1515,12 @@ def main():
 
     application.add_handler(conv_handler)
     application.add_handler(CommandHandler('help', bot.help_command))
+
+    # Add message handler to track users in groups (runs for all messages)
+    application.add_handler(
+        MessageHandler(filters.ALL & ~filters.COMMAND, bot.track_user),
+        group=1  # Lower priority so it doesn't interfere with conversation handler
+    )
 
     # Start the bot
     logger.info("Bot started!")
