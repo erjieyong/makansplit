@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  bot:
+    build: .
+    container_name: bill-splitter-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./temp_photos:/app/temp_photos
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

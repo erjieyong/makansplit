@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.env
+.venv
+*.log
+temp_photos/
+*.db
+.DS_Store
+uv.lock
+user_pairings.json
+temp_photos/saved_headshots/
