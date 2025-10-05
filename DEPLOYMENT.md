@@ -10,13 +10,154 @@ This guide covers deploying the MakanSplit bot to AWS using Docker.
 
 ## Deployment Options
 
-### Option 1: AWS ECS/Fargate (Recommended)
+### Option 1: AWS App Runner (Easiest & Recommended)
 
 **Advantages:**
-- Fully managed, no server maintenance
-- Auto-scaling capabilities
-- Pay only for what you use
-- Built-in health checks and restart policies
+- **Simplest AWS deployment option**
+- Fully managed - no infrastructure management
+- Automatic deployments from ECR or GitHub
+- Built-in load balancing and auto-scaling
+- Automatic HTTPS
+- Pay only for what you use (~$25-30/month)
+
+**Steps:**
+
+#### 1. Create ECR Repository
+
+```bash
+aws ecr create-repository \
+    --repository-name makansplit-bot \
+    --region ap-southeast-1
+```
+
+#### 2. Build and Push Docker Image
+
+```bash
+# Login to ECR
+aws ecr get-login-password --region ap-southeast-1 | \
+docker login --username AWS --password-stdin \
+YOUR_ACCOUNT_ID.dkr.ecr.ap-southeast-1.amazonaws.com
+
+# Build image
+docker build -t makansplit-bot .
+
+# Tag image
+docker tag makansplit-bot:latest \
+YOUR_ACCOUNT_ID.dkr.ecr.ap-southeast-1.amazonaws.com/makansplit-bot:latest
+
+# Push to ECR
+docker push \
+YOUR_ACCOUNT_ID.dkr.ecr.ap-southeast-1.amazonaws.com/makansplit-bot:latest
+```
+
+#### 3. Create App Runner Service via AWS Console
+
+1. Go to AWS App Runner console: https://console.aws.amazon.com/apprunner
+2. Click **Create service**
+3. **Source:**
+   - Repository type: **Container registry**
+   - Provider: **Amazon ECR**
+   - Container image URI: `YOUR_ACCOUNT_ID.dkr.ecr.ap-southeast-1.amazonaws.com/makansplit-bot:latest`
+   - Deployment trigger: **Manual** (or Automatic for CI/CD)
+4. **Deployment settings:**
+   - ECR access role: Create new or use existing with ECR permissions
+5. **Service settings:**
+   - Service name: `makansplit-bot`
+   - CPU: **1 vCPU**
+   - Memory: **2 GB**
+   - Port: `8080` (not used, but required field)
+   - Environment variables: Add your credentials
+     ```
+     TELEGRAM_BOT_TOKEN=your_token
+     OPENROUTER_API_KEY=your_key
+     OPENROUTER_MODEL=google/gemini-2.5-flash-lite-preview-09-2025
+     PAYNOW_RECIPIENT_PHONE=+6512345678
+     PAYNOW_RECIPIENT_NAME=Your Name
+     ```
+6. **Auto scaling:**
+   - Min instances: **1**
+   - Max instances: **1** (bot doesn't need scaling)
+7. **Health check:**
+   - Protocol: **TCP** (since bot doesn't expose HTTP endpoint)
+   - Interval: 10 seconds
+8. Click **Create & deploy**
+
+#### 4. Create App Runner Service via CLI (Alternative)
+
+Create a file `apprunner.json`:
+
+```json
+{
+  "ServiceName": "makansplit-bot",
+  "SourceConfiguration": {
+    "ImageRepository": {
+      "ImageIdentifier": "YOUR_ACCOUNT_ID.dkr.ecr.ap-southeast-1.amazonaws.com/makansplit-bot:latest",
+      "ImageRepositoryType": "ECR",
+      "ImageConfiguration": {
+        "Port": "8080",
+        "RuntimeEnvironmentVariables": {
+          "TELEGRAM_BOT_TOKEN": "your_token",
+          "OPENROUTER_API_KEY": "your_key",
+          "OPENROUTER_MODEL": "google/gemini-2.5-flash-lite-preview-09-2025",
+          "PAYNOW_RECIPIENT_PHONE": "+6512345678",
+          "PAYNOW_RECIPIENT_NAME": "Your Name"
+        }
+      }
+    },
+    "AutoDeploymentsEnabled": false,
+    "AuthenticationConfiguration": {
+      "AccessRoleArn": "arn:aws:iam::YOUR_ACCOUNT_ID:role/AppRunnerECRAccessRole"
+    }
+  },
+  "InstanceConfiguration": {
+    "Cpu": "1 vCPU",
+    "Memory": "2 GB"
+  }
+}
+```
+
+Deploy:
+
+```bash
+aws apprunner create-service --cli-input-json file://apprunner.json --region ap-southeast-1
+```
+
+#### 5. Monitor Deployment
+
+```bash
+# Check service status
+aws apprunner list-services --region ap-southeast-1
+
+# View service details
+aws apprunner describe-service \
+    --service-arn YOUR_SERVICE_ARN \
+    --region ap-southeast-1
+
+# View logs in CloudWatch
+aws logs tail /aws/apprunner/makansplit-bot --follow
+```
+
+#### 6. Update App Runner Service
+
+```bash
+# Build and push new image (same as step 2)
+docker build -t makansplit-bot .
+docker tag makansplit-bot:latest YOUR_ACCOUNT_ID.dkr.ecr.ap-southeast-1.amazonaws.com/makansplit-bot:latest
+docker push YOUR_ACCOUNT_ID.dkr.ecr.ap-southeast-1.amazonaws.com/makansplit-bot:latest
+
+# Trigger new deployment (if manual)
+aws apprunner start-deployment \
+    --service-arn YOUR_SERVICE_ARN \
+    --region ap-southeast-1
+```
+
+### Option 2: AWS ECS/Fargate
+
+**Advantages:**
+- More control over infrastructure
+- Better for complex deployments
+- VPC networking control
+- Lower cost for very small workloads (~$35/month)
 
 **Steps:**
 
@@ -258,17 +399,111 @@ sudo systemctl enable makansplit
 sudo systemctl start makansplit
 ```
 
-## Cost Estimates
+## Cost Comparison (Singapore ap-southeast-1 Region)
+
+### AWS App Runner (Recommended)
+**Configuration:** 1 vCPU, 2 GB RAM, 1 instance
+
+**Pricing Breakdown:**
+- **Provisioned container:** $0.007/hour = $5.04/month
+- **Active container:** $0.064/vCPU-hour + $0.007/GB-hour
+  - vCPU: $0.064 × 1 × 730 hours = $46.72/month
+  - Memory: $0.007 × 2 × 730 hours = $10.22/month
+- **Build:** $0.005/build minute (only if building from source)
+
+**Total: ~$62/month (24/7 operation)**
+
+**Advantages:**
+- ✅ Zero infrastructure management
+- ✅ Automatic scaling (if needed)
+- ✅ Built-in load balancer
+- ✅ Auto-deployments from ECR/GitHub
+- ✅ Automatic HTTPS
+- ❌ Higher cost
 
 ### ECS Fargate
-- CPU: 0.5 vCPU = $0.04048/hour
-- Memory: 1 GB = $0.004445/hour
-- **Total: ~$35/month** (24/7 operation)
+**Configuration:** 0.5 vCPU, 1 GB RAM
+
+**Pricing Breakdown:**
+- vCPU: $0.04048/vCPU-hour × 0.5 × 730 hours = $14.78/month
+- Memory: $0.004445/GB-hour × 1 × 730 hours = $3.24/month
+
+**Total: ~$18/month (24/7 operation)**
+
+**With 1 vCPU, 2 GB RAM:**
+- vCPU: $0.04048 × 1 × 730 = $29.55/month
+- Memory: $0.004445 × 2 × 730 = $6.49/month
+- **Total: ~$36/month**
+
+**Advantages:**
+- ✅ More control over infrastructure
+- ✅ VPC networking
+- ✅ Lower cost than App Runner
+- ✅ Good for multiple services
+- ❌ More complex setup
+- ❌ Need to manage ECS cluster
 
 ### EC2 t3.micro
-- Instance: $0.0104/hour
-- **Total: ~$7.50/month** (24/7 operation)
-- Storage: ~$1/month for 8GB
+**Configuration:** 2 vCPU, 1 GB RAM
+
+**Pricing Breakdown:**
+- Instance: $0.0104/hour × 730 hours = $7.59/month
+- Storage (8GB EBS): $0.10/GB-month × 8 = $0.80/month
+- Data transfer: ~$1-2/month
+
+**Total: ~$9-10/month (24/7 operation)**
+
+**Advantages:**
+- ✅ Lowest cost option
+- ✅ Full server control
+- ✅ Good for learning/testing
+- ❌ Need to manage OS updates
+- ❌ Manual scaling
+- ❌ No auto-restart (need systemd)
+
+### EC2 t4g.micro (ARM-based, even cheaper!)
+**Configuration:** 2 vCPU, 1 GB RAM
+
+**Pricing Breakdown:**
+- Instance: $0.0084/hour × 730 hours = $6.13/month
+- Storage: $0.80/month
+- Data transfer: ~$1-2/month
+
+**Total: ~$8-9/month (24/7 operation)**
+
+**Note:** Requires ARM-compatible Docker image (slight Dockerfile change)
+
+## Cost Comparison Summary
+
+| Option | Monthly Cost | Complexity | Management | Best For |
+|--------|--------------|------------|------------|----------|
+| **App Runner** | **$62** | ⭐ Easy | Zero | Production, hands-off |
+| **ECS Fargate** | **$18-36** | ⭐⭐ Medium | Low | Production, AWS native |
+| **EC2 t3.micro** | **$9-10** | ⭐⭐⭐ Hard | High | Budget, learning |
+| **EC2 t4g.micro** | **$8-9** | ⭐⭐⭐ Hard | High | Cheapest option |
+
+## Recommendation by Use Case
+
+### 🚀 Production (Hands-off)
+**→ AWS App Runner**
+- Worth the extra cost for zero management
+- Automatic deployments
+- Built-in monitoring and scaling
+
+### 💼 Production (Cost-conscious)
+**→ ECS Fargate (0.5 vCPU, 1 GB)**
+- Best price/performance ratio at $18/month
+- Managed service with some AWS control
+- Easy to scale if needed
+
+### 💰 Budget/Testing
+**→ EC2 t3.micro or t4g.micro**
+- Extremely cheap at $8-10/month
+- Good for learning and testing
+- Requires more manual management
+
+### ⚡ Current Running Bot
+Since your bot is already running locally, **App Runner or ECS Fargate** are recommended for production to avoid server maintenance.
 
 ## Monitoring and Maintenance
 
