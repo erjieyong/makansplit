@@ -71,9 +71,8 @@ YOUR_ACCOUNT_ID.dkr.ecr.ap-southeast-1.amazonaws.com/makansplit-bot:latest
      TELEGRAM_BOT_TOKEN=your_token
      OPENROUTER_API_KEY=your_key
      OPENROUTER_MODEL=google/gemini-2.5-flash-lite-preview-09-2025
-     PAYNOW_RECIPIENT_PHONE=+6512345678
-     PAYNOW_RECIPIENT_NAME=Your Name
      ```
+     Note: PayNow recipient info is now collected dynamically from users
 6. **Auto scaling:**
    - Min instances: **1**
    - Max instances: **1** (bot doesn't need scaling)
@@ -98,9 +97,7 @@ Create a file `apprunner.json`:
         "RuntimeEnvironmentVariables": {
           "TELEGRAM_BOT_TOKEN": "your_token",
           "OPENROUTER_API_KEY": "your_key",
-          "OPENROUTER_MODEL": "google/gemini-2.5-flash-lite-preview-09-2025",
-          "PAYNOW_RECIPIENT_PHONE": "+6512345678",
-          "PAYNOW_RECIPIENT_NAME": "Your Name"
+          "OPENROUTER_MODEL": "google/gemini-2.5-flash-lite-preview-09-2025"
         }
       }
     },
@@ -217,14 +214,6 @@ Create a file `task-definition.json`:
         {
           "name": "OPENROUTER_MODEL",
           "value": "google/gemini-2.5-flash-lite-preview-09-2025"
-        },
-        {
-          "name": "PAYNOW_RECIPIENT_PHONE",
-          "value": "+6512345678"
-        },
-        {
-          "name": "PAYNOW_RECIPIENT_NAME",
-          "value": "Your Name"
         }
       ],
       "logConfiguration": {
@@ -582,9 +571,11 @@ aws logs tail /ecs/makansplit-bot --since 30m
 
 ## Backup Strategy
 
-The bot is stateless except for:
-- `user_pairings.json` - User-to-person mappings
-- Recommendation: Mount EFS volume for persistent storage
+The bot maintains persistent state in:
+- `user_pairings.json` - Person-to-Telegram-user mappings for Photo AI mode
+- `user_paynow.json` - User PayNow recipient information (phone + name)
+
+Recommendation: Mount EFS volume for persistent storage
 
 ```bash
 # Create EFS filesystem
