@@ -1,6 +1,6 @@
 import logging
 import os
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -13,6 +13,7 @@ from telegram.ext import (
 from config import (
     TELEGRAM_BOT_TOKEN,
     WAITING_BILL_PHOTO,
+    COLLECTING_RECIPIENT_INFO,
     CHOOSING_SPLIT_MODE,
     TAGGING_USERS,
     MANUAL_ASSIGNMENT,
@@ -28,6 +29,7 @@ from bill_analyzer import BillAnalyzer
 from person_matcher import PersonMatcher
 from paynow_generator import PayNowGenerator
 from user_matcher import UserMatcher
+from paynow_storage import PayNowStorage
 
 # Enable logging
 logging.basicConfig(
@@ -41,11 +43,11 @@ class BillSplitterBot:
     def __init__(self):
         self.bill_analyzer = BillAnalyzer()
         self.person_matcher = PersonMatcher()
-        self.paynow_generator = PayNowGenerator()
         self.user_matcher = UserMatcher()
+        self.paynow_storage = PayNowStorage()
 
-    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """Start the conversation and ask for bill photo."""
+    async def makansplit(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Start the bill splitting conversation."""
         user = update.effective_user
 
         # Check if user is restarting mid-flow
@@ -96,24 +98,60 @@ class BillSplitterBot:
             summary = self.bill_analyzer.format_bill_summary(bill_data)
             await update.message.reply_text(summary, parse_mode='Markdown')
 
-            # Show splitting mode options
-            keyboard = [
-                [InlineKeyboardButton("➗ Split Evenly", callback_data="mode_even")],
-                [InlineKeyboardButton("✏️ Split Manually", callback_data="mode_manual")],
-                [InlineKeyboardButton("📸 Split by Photo (AI)", callback_data="mode_photo")]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
+            # Check if user has saved PayNow info
+            user_id = update.effective_user.id
+            saved_paynow = self.paynow_storage.get_user_paynow(user_id)
 
-            await update.message.reply_text(
-                "\n💡 *How would you like to split the bill?*\n\n"
-                "• *Split Evenly* - Divide equally among everyone\n"
-                "• *Split Manually* - Manually assign who ate what\n"
-                "• *Split by Photo (AI)* - Auto-detect from group photo",
-                reply_markup=reply_markup,
-                parse_mode='Markdown'
-            )
+            if saved_paynow:
+                # User has saved info, ask for confirmation
+                keyboard = [
+                    [InlineKeyboardButton("✅ Use This Info", callback_data="paynow_confirm")],
+                    [InlineKeyboardButton("✏️ Use Different Info", callback_data="paynow_new")]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
 
-            return CHOOSING_SPLIT_MODE
+                await update.message.reply_text(
+                    "💳 *PayNow Recipient Information*\n\n"
+                    "I found your saved PayNow details:\n\n"
+                    f"📱 {saved_paynow['phone']}\n"
+                    f"👤 {saved_paynow['name']}\n\n"
+                    "Use this information?",
+                    reply_markup=reply_markup,
+                    parse_mode='Markdown'
+                )
+            else:
+                # No saved info, ask for it
+                chat_type = update.effective_chat.type
+
+                if chat_type == 'private':
+                    # In private chats, we can use contact sharing
+                    contact_button = KeyboardButton("📱 Share My Contact", request_contact=True)
+                    reply_keyboard = ReplyKeyboardMarkup(
+                        [[contact_button]],
+                        one_time_keyboard=True,
+                        resize_keyboard=True
+                    )
+
+                    await update.message.reply_text(
+                        "💳 *PayNow Recipient Information*\n\n"
+                        "Please share your contact so others can pay you via PayNow.\n\n"
+                        "Tap the button below to share your phone number 👇\n\n"
+                        "_This is where others will send payment to._",
+                        reply_markup=reply_keyboard,
+                        parse_mode='Markdown'
+                    )
+                else:
+                    # In group chats, ask for manual input
+                    await update.message.reply_text(
+                        "💳 *PayNow Recipient Information*\n\n"
+                        "Please send your PayNow details in this format:\n\n"
+                        "`+6512345678 | John Doe`\n\n"
+                        "Format: `phone_number | recipient_name`\n\n"
+                        "_This is where others will send payment to._",
+                        parse_mode='Markdown'
+                    )
+
+            return COLLECTING_RECIPIENT_INFO
 
         except Exception as e:
             logger.error(f"Error analyzing bill: {e}")
@@ -126,6 +164,178 @@ class BillSplitterBot:
                 "✓ No glare or shadows"
             )
             return WAITING_BILL_PHOTO
+
+    async def handle_paynow_confirmation(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> int:
+        """Handle PayNow info confirmation."""
+        query = update.callback_query
+        await query.answer()
+
+        user_id = update.effective_user.id
+
+        if query.data == "paynow_confirm":
+            # Use saved info
+            saved_paynow = self.paynow_storage.get_user_paynow(user_id)
+            if saved_paynow:
+                context.user_data['paynow_phone'] = saved_paynow['phone']
+                context.user_data['paynow_name'] = saved_paynow['name']
+
+                await query.edit_message_text(
+                    f"✅ Using saved PayNow info:\n"
+                    f"📱 {saved_paynow['phone']}\n"
+                    f"👤 {saved_paynow['name']}\n\n"
+                    f"Now let's split the bill!"
+                )
+
+                # Show splitting mode options
+                keyboard = [
+                    [InlineKeyboardButton("➗ Split Evenly", callback_data="mode_even")],
+                    [InlineKeyboardButton("✏️ Split Manually", callback_data="mode_manual")],
+                    [InlineKeyboardButton("📸 Split by Photo (AI)", callback_data="mode_photo")]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text="\n💡 *How would you like to split the bill?*\n\n"
+                         "• *Split Evenly* - Divide equally among everyone\n"
+                         "• *Split Manually* - Manually assign who ate what\n"
+                         "• *Split by Photo (AI)* - Auto-detect from group photo",
+                    reply_markup=reply_markup,
+                    parse_mode='Markdown'
+                )
+
+                return CHOOSING_SPLIT_MODE
+        else:  # paynow_new
+            # Ask for new info
+            await query.edit_message_text(
+                "💳 *Enter New PayNow Information*\n\n"
+                "Please send your PayNow details in this format:\n\n"
+                "`+6512345678 | John Doe`\n\n"
+                "Format: `phone_number | recipient_name`",
+                parse_mode='Markdown'
+            )
+            return COLLECTING_RECIPIENT_INFO
+
+    async def collect_recipient_info(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> int:
+        """Collect PayNow recipient information from user contact."""
+        # Check if contact was shared
+        if update.message.contact:
+            contact = update.message.contact
+            phone = contact.phone_number
+
+            # Ensure phone number has country code
+            if not phone.startswith('+'):
+                phone = '+' + phone
+
+            # Get name from contact (or fallback to Telegram name)
+            name = f"{contact.first_name or ''} {contact.last_name or ''}".strip()
+            if not name:
+                name = update.effective_user.first_name or "User"
+
+            # Store recipient info in session and persistent storage
+            context.user_data['paynow_phone'] = phone
+            context.user_data['paynow_name'] = name
+
+            user_id = update.effective_user.id
+            self.paynow_storage.save_user_paynow(user_id, phone, name)
+
+            await update.message.reply_text(
+                f"✅ PayNow recipient set and saved for future use:\n"
+                f"📱 {phone}\n"
+                f"👤 {name}\n\n"
+                f"Now let's split the bill!",
+                reply_markup=ReplyKeyboardRemove()
+            )
+        else:
+            # Handle text input (fallback for manual entry)
+            message_text = update.message.text.strip()
+
+            # Parse format: +6512345678 | John Doe
+            if '|' not in message_text:
+                contact_button = KeyboardButton("📱 Share My Contact", request_contact=True)
+                reply_keyboard = ReplyKeyboardMarkup(
+                    [[contact_button]],
+                    one_time_keyboard=True,
+                    resize_keyboard=True
+                )
+                await update.message.reply_text(
+                    "❌ Please share your contact using the button, or type in this format:\n\n"
+                    "`+6512345678 | John Doe`",
+                    reply_markup=reply_keyboard,
+                    parse_mode='Markdown'
+                )
+                return COLLECTING_RECIPIENT_INFO
+
+            parts = message_text.split('|')
+            if len(parts) != 2:
+                contact_button = KeyboardButton("📱 Share My Contact", request_contact=True)
+                reply_keyboard = ReplyKeyboardMarkup(
+                    [[contact_button]],
+                    one_time_keyboard=True,
+                    resize_keyboard=True
+                )
+                await update.message.reply_text(
+                    "❌ Invalid format. Please use: `+6512345678 | John Doe`",
+                    reply_markup=reply_keyboard,
+                    parse_mode='Markdown'
+                )
+                return COLLECTING_RECIPIENT_INFO
+
+            phone = parts[0].strip()
+            name = parts[1].strip()
+
+            # Basic validation
+            if not phone.startswith('+'):
+                await update.message.reply_text(
+                    "❌ Phone number must start with country code (e.g., +65)",
+                    parse_mode='Markdown'
+                )
+                return COLLECTING_RECIPIENT_INFO
+
+            if not name:
+                await update.message.reply_text(
+                    "❌ Recipient name cannot be empty",
+                    parse_mode='Markdown'
+                )
+                return COLLECTING_RECIPIENT_INFO
+
+            # Store recipient info in session and persistent storage
+            context.user_data['paynow_phone'] = phone
+            context.user_data['paynow_name'] = name
+
+            user_id = update.effective_user.id
+            self.paynow_storage.save_user_paynow(user_id, phone, name)
+
+            await update.message.reply_text(
+                f"✅ PayNow recipient set and saved for future use:\n"
+                f"📱 {phone}\n"
+                f"👤 {name}\n\n"
+                f"Now let's split the bill!",
+                reply_markup=ReplyKeyboardRemove()
+            )
+
+        # Show splitting mode options
+        keyboard = [
+            [InlineKeyboardButton("➗ Split Evenly", callback_data="mode_even")],
+            [InlineKeyboardButton("✏️ Split Manually", callback_data="mode_manual")],
+            [InlineKeyboardButton("📸 Split by Photo (AI)", callback_data="mode_photo")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await update.message.reply_text(
+            "\n💡 *How would you like to split the bill?*\n\n"
+            "• *Split Evenly* - Divide equally among everyone\n"
+            "• *Split Manually* - Manually assign who ate what\n"
+            "• *Split by Photo (AI)* - Auto-detect from group photo",
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+        return CHOOSING_SPLIT_MODE
 
     async def handle_split_mode_choice(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -312,7 +522,10 @@ class BillSplitterBot:
             user_info = {member['id']: member for member in chat_members}
             context.user_data['user_info'] = user_info
 
-            # Show summary
+            # Show summary with recipient info
+            paynow_phone = context.user_data.get('paynow_phone', 'N/A')
+            paynow_name = context.user_data.get('paynow_name', 'N/A')
+
             summary = f"📊 *Even Split Summary*\n\n"
             summary += f"Total: ${total:.2f}\n"
             summary += f"Split {len(tagged_users)} ways: ${per_person:.2f} per person\n\n"
@@ -320,6 +533,10 @@ class BillSplitterBot:
             for user_id in tagged_users:
                 if user_id in user_info:
                     summary += f"• {user_info[user_id]['first_name']} - ${per_person:.2f}\n"
+
+            summary += f"\n*PayNow Recipient:*\n"
+            summary += f"📱 {paynow_phone}\n"
+            summary += f"👤 {paynow_name}"
 
             await context.bot.send_message(
                 chat_id=update.effective_chat.id,
@@ -704,6 +921,13 @@ class BillSplitterBot:
             summary += "\n⚠️ *Unassigned items:*\n"
             summary += '\n'.join(unassigned)
             summary += "\n\n"
+
+        # Add PayNow recipient info
+        paynow_phone = context.user_data.get('paynow_phone', 'N/A')
+        paynow_name = context.user_data.get('paynow_name', 'N/A')
+        summary += f"\n*PayNow Recipient:*\n"
+        summary += f"📱 {paynow_phone}\n"
+        summary += f"👤 {paynow_name}"
 
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
@@ -1116,6 +1340,17 @@ class BillSplitterBot:
                      "Please review carefully!"
             )
 
+        # Show PayNow recipient info
+        paynow_phone = context.user_data.get('paynow_phone', 'N/A')
+        paynow_name = context.user_data.get('paynow_name', 'N/A')
+        recipient_text = f"\n*PayNow Recipient:*\n📱 {paynow_phone}\n👤 {paynow_name}\n"
+
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=recipient_text,
+            parse_mode='Markdown'
+        )
+
         # Ask for confirmation
         keyboard = [
             [
@@ -1205,6 +1440,19 @@ class BillSplitterBot:
             user_info = context.user_data.get('user_info', {})
             split_mode = context.user_data.get('split_mode', 'photo')
 
+            # Create PayNowGenerator with dynamic recipient info
+            paynow_phone = context.user_data.get('paynow_phone')
+            paynow_name = context.user_data.get('paynow_name')
+
+            if not paynow_phone or not paynow_name:
+                await context.bot.send_message(
+                    chat_id=context.user_data['chat_id'],
+                    text="❌ PayNow recipient information missing. Please restart with /makansplit"
+                )
+                return ConversationHandler.END
+
+            paynow_generator = PayNowGenerator(paynow_phone, paynow_name)
+
             restaurant = bill_data.get('restaurant', 'Restaurant')
 
             # Handle different split modes
@@ -1214,13 +1462,16 @@ class BillSplitterBot:
                     user_name = user_info.get(user_id, {}).get('first_name', 'there')
 
                     message = f"💰 *Bill Split Request*\n\n"
-                    message += f"Restaurant: {restaurant}\n"
+                    message += f"📍 {restaurant}\n"
                     message += f"Your share (even split): *${amount:.2f}*\n\n"
+                    message += f"*Pay to:*\n"
+                    message += f"📱 {paynow_phone}\n"
+                    message += f"👤 {paynow_name}\n\n"
                     message += "Please scan the QR code below to pay via PayNow."
 
                     # Generate QR code
                     reference = f"{restaurant[:15]} split"
-                    qr_code = self.paynow_generator.generate_qr_code(
+                    qr_code = paynow_generator.generate_qr_code(
                         amount, reference, user_name
                     )
 
@@ -1268,13 +1519,13 @@ class BillSplitterBot:
                             user_items.append(item)
 
                     # Generate message
-                    message = self.paynow_generator.format_payment_message(
+                    message = paynow_generator.format_payment_message(
                         amount, user_items, restaurant
                     )
 
                     # Generate QR code
                     reference = f"{restaurant[:15]} split"
-                    qr_code = self.paynow_generator.generate_qr_code(
+                    qr_code = paynow_generator.generate_qr_code(
                         amount, reference, user_name
                     )
 
@@ -1323,13 +1574,13 @@ class BillSplitterBot:
                         person_items.append(item)
 
                     # Generate message
-                    message = self.paynow_generator.format_payment_message(
+                    message = paynow_generator.format_payment_message(
                         amount, person_items, restaurant
                     )
 
                     # Generate QR code
                     reference = f"{restaurant[:15]} split"
-                    qr_code = self.paynow_generator.generate_qr_code(
+                    qr_code = paynow_generator.generate_qr_code(
                         amount, reference, f"Person {person_id}"
                     )
 
@@ -1391,7 +1642,7 @@ class BillSplitterBot:
                 text="✅ *All done!*\n\n"
                      "Payment requests sent to everyone. "
                      "Please scan your respective QR codes to pay.\n\n"
-                     "Use /start to split another bill.",
+                     "Use /makansplit to split another bill.",
                 parse_mode='Markdown'
             )
 
@@ -1405,20 +1656,34 @@ class BillSplitterBot:
             )
             return ConversationHandler.END
 
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Welcome message for new users."""
+        await update.message.reply_text(
+            "👋 *Welcome to MakanSplit!*\n\n"
+            "I help you split restaurant bills fairly in Singapore using PayNow!\n\n"
+            "*Quick Start:*\n"
+            "Use /makansplit to begin splitting a bill\n\n"
+            "*Commands:*\n"
+            "• /makansplit - Start bill splitting\n"
+            "• /help - Show detailed help\n"
+            "• /cancel - Cancel current operation",
+            parse_mode='Markdown'
+        )
+
     async def cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         """Cancel the conversation."""
         await update.message.reply_text(
-            "❌ Cancelled. Send /start to begin again."
+            "❌ Cancelled. Send /makansplit to begin again."
         )
         return ConversationHandler.END
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Send help message."""
         await update.message.reply_text(
-            "*Bill Splitter Bot* 💰\n\n"
+            "*MakanSplit Bot* 💰\n\n"
             "I help you split restaurant bills with three different modes!\n\n"
             "*Commands:*\n"
-            "/start - Start splitting a bill\n"
+            "/makansplit - Start splitting a bill\n"
             "/cancel - Cancel current operation\n"
             "/help - Show this help message\n\n"
             "*How it works:*\n"
@@ -1469,51 +1734,57 @@ def main():
 
     # Add conversation handler
     conv_handler = ConversationHandler(
-        entry_points=[CommandHandler('start', bot.start)],
+        entry_points=[CommandHandler('makansplit', bot.makansplit)],
         states={
             WAITING_BILL_PHOTO: [
-                CommandHandler('start', bot.start),
+                CommandHandler('makansplit', bot.makansplit),
                 MessageHandler(filters.PHOTO, bot.receive_bill_photo)
             ],
+            COLLECTING_RECIPIENT_INFO: [
+                CommandHandler('makansplit', bot.makansplit),
+                CallbackQueryHandler(bot.handle_paynow_confirmation, pattern="^paynow_"),
+                MessageHandler(filters.CONTACT | (filters.TEXT & ~filters.COMMAND), bot.collect_recipient_info)
+            ],
             CHOOSING_SPLIT_MODE: [
-                CommandHandler('start', bot.start),
+                CommandHandler('makansplit', bot.makansplit),
                 CallbackQueryHandler(bot.handle_split_mode_choice)
             ],
             TAGGING_USERS: [
-                CommandHandler('start', bot.start),
+                CommandHandler('makansplit', bot.makansplit),
                 CallbackQueryHandler(bot.handle_user_tagging)
             ],
             MANUAL_ASSIGNMENT: [
-                CommandHandler('start', bot.start),
+                CommandHandler('makansplit', bot.makansplit),
                 CallbackQueryHandler(bot.handle_manual_assignment)
             ],
             WAITING_GROUP_PHOTO: [
-                CommandHandler('start', bot.start),
+                CommandHandler('makansplit', bot.makansplit),
                 MessageHandler(filters.PHOTO, bot.receive_group_photo)
             ],
             MATCHING_USERS: [
-                CommandHandler('start', bot.start),
+                CommandHandler('makansplit', bot.makansplit),
                 CallbackQueryHandler(bot.handle_person_match),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_manual_input)
             ],
             CONFIRMING: [
-                CommandHandler('start', bot.start),
+                CommandHandler('makansplit', bot.makansplit),
                 CallbackQueryHandler(bot.handle_confirmation)
             ],
             CORRECTING: [
-                CommandHandler('start', bot.start),
+                CommandHandler('makansplit', bot.makansplit),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_corrections),
                 CallbackQueryHandler(bot.handle_confirmation)
             ],
         },
         fallbacks=[
             CommandHandler('cancel', bot.cancel),
-            CommandHandler('start', bot.start)
+            CommandHandler('makansplit', bot.makansplit)
         ],
         per_message=False,
     )
 
     application.add_handler(conv_handler)
+    application.add_handler(CommandHandler('start', bot.start))
     application.add_handler(CommandHandler('help', bot.help_command))
 
     # Add message handler to track users in groups (runs for all messages)

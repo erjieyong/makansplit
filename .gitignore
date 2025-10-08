@@ -38,6 +38,7 @@ env/
 temp_photos/
 temp_photos/saved_headshots/
 user_pairings.json
+user_paynow.json
 *.tmp
 *.log
 *.db

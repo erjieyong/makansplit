@@ -1,7 +1,6 @@
 from paynow import PayNowQR
 from io import BytesIO
 from typing import Optional
-from config import PAYNOW_RECIPIENT_PHONE, PAYNOW_RECIPIENT_NAME
 import os
 import tempfile
 
@@ -10,10 +9,10 @@ class PayNowGenerator:
     """Generate PayNow QR codes for Singapore payments using PayNowQR library."""
 
     def __init__(
-        self, recipient_phone: Optional[str] = None, recipient_name: Optional[str] = None
+        self, recipient_phone: str, recipient_name: str
     ):
-        self.recipient_phone = recipient_phone or PAYNOW_RECIPIENT_PHONE
-        self.recipient_name = recipient_name or PAYNOW_RECIPIENT_NAME
+        self.recipient_phone = recipient_phone
+        self.recipient_name = recipient_name
 
     def generate_qr_code(
         self, amount: float, reference: str = "", person_name: str = ""
@@ -89,6 +88,9 @@ class PayNowGenerator:
                 lines.append(f"• {item['name']} - ${item['total_price']:.2f}")
 
         lines.append(f"\n*Total Amount: ${amount:.2f}*")
+        lines.append(f"\n*Pay to:*")
+        lines.append(f"📱 {self.recipient_phone}")
+        lines.append(f"👤 {self.recipient_name}")
         lines.append(f"\nPlease scan the QR code below to pay via PayNow:")
 
         return '\n'.join(lines)
