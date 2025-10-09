@@ -63,7 +63,7 @@ echo -e "${GREEN}✓ Logged in to ECR${NC}"
 
 # Step 3: Build Docker image
 echo -e "\n${YELLOW}🏗️  Building Docker image...${NC}"
-docker build -t "$ECR_REPOSITORY" .
+docker build --platform linux/amd64 -t "$ECR_REPOSITORY" .
 echo -e "${GREEN}✓ Docker image built${NC}"
 
 # Step 4: Get version from VERSION file

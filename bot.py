@@ -1,5 +1,7 @@
 import logging
 import os
+import asyncio
+from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application,
@@ -1724,6 +1726,24 @@ class BillSplitterBot:
                 }
 
 
+async def health_check(request):
+    """Health check endpoint for AWS App Runner."""
+    return web.Response(text="OK", status=200)
+
+
+async def start_health_server():
+    """Start health check HTTP server on port 8080."""
+    app = web.Application()
+    app.router.add_get('/health', health_check)
+    app.router.add_get('/', health_check)  # Also respond to root path
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', 8080)
+    await site.start()
+    logger.info("Health check server started on port 8080")
+
+
 def main():
     """Start the bot."""
     # Create bot instance
@@ -1795,6 +1815,10 @@ def main():
 
     # Start the bot
     logger.info("Bot started!")
+
+    # Start health check server in background
+    asyncio.get_event_loop().create_task(start_health_server())
+
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

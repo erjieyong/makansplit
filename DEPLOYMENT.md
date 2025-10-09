@@ -38,8 +38,8 @@ aws ecr get-login-password --region ap-southeast-1 | \
 docker login --username AWS --password-stdin \
 YOUR_ACCOUNT_ID.dkr.ecr.ap-southeast-1.amazonaws.com
 
-# Build image
-docker build -t makansplit-bot .
+# Build image (with platform flag for compatibility)
+docker build --platform linux/amd64 -t makansplit-bot .
 
 # Tag image
 docker tag makansplit-bot:latest \
@@ -65,7 +65,7 @@ YOUR_ACCOUNT_ID.dkr.ecr.ap-southeast-1.amazonaws.com/makansplit-bot:latest
    - Service name: `makansplit-bot`
    - CPU: **1 vCPU**
    - Memory: **2 GB**
-   - Port: `8080` (not used, but required field)
+   - Port: `8080` (health check server)
    - Environment variables: Add your credentials
      ```
      TELEGRAM_BOT_TOKEN=your_token
@@ -73,12 +73,15 @@ YOUR_ACCOUNT_ID.dkr.ecr.ap-southeast-1.amazonaws.com/makansplit-bot:latest
      OPENROUTER_MODEL=google/gemini-2.5-flash-lite-preview-09-2025
      ```
      Note: PayNow recipient info is now collected dynamically from users
+     Note: The bot includes a lightweight HTTP health check server on port 8080 for App Runner compatibility
 6. **Auto scaling:**
    - Min instances: **1**
    - Max instances: **1** (bot doesn't need scaling)
 7. **Health check:**
-   - Protocol: **TCP** (since bot doesn't expose HTTP endpoint)
+   - Protocol: **TCP** (default)
+   - Path: `/health` (optional, bot responds to both `/` and `/health`)
    - Interval: 10 seconds
+   - Timeout: 5 seconds
 8. Click **Create & deploy**
 
 #### 4. Create App Runner Service via CLI (Alternative)
@@ -138,7 +141,7 @@ aws logs tail /aws/apprunner/makansplit-bot --follow
 
 ```bash
 # Build and push new image (same as step 2)
-docker build -t makansplit-bot .
+docker build --platform linux/amd64 -t makansplit-bot .
 docker tag makansplit-bot:latest YOUR_ACCOUNT_ID.dkr.ecr.ap-southeast-1.amazonaws.com/makansplit-bot:latest
 docker push YOUR_ACCOUNT_ID.dkr.ecr.ap-southeast-1.amazonaws.com/makansplit-bot:latest
 
@@ -174,8 +177,8 @@ aws ecr get-login-password --region ap-southeast-1 | \
 docker login --username AWS --password-stdin \
 YOUR_ACCOUNT_ID.dkr.ecr.ap-southeast-1.amazonaws.com
 
-# Build image
-docker build -t makansplit-bot .
+# Build image (with platform flag for compatibility)
+docker build --platform linux/amd64 -t makansplit-bot .
 
 # Tag image
 docker tag makansplit-bot:latest \
@@ -526,7 +529,7 @@ aws logs tail /ecs/makansplit-bot --follow
 
 ```bash
 # Build and push new image
-docker build -t makansplit-bot .
+docker build --platform linux/amd64 -t makansplit-bot .
 docker tag makansplit-bot:latest YOUR_ACCOUNT_ID.dkr.ecr.ap-southeast-1.amazonaws.com/makansplit-bot:latest
 docker push YOUR_ACCOUNT_ID.dkr.ecr.ap-southeast-1.amazonaws.com/makansplit-bot:latest
 
